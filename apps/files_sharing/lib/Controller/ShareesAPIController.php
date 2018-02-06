@@ -695,6 +695,9 @@ class ShareesAPIController extends OCSController {
 
 		if (!$this->shareeEnumeration) {
 			$result['results'] = [];
+		} else if (count($result['results']) > $this->limit) {
+			// Limit the number of search results to the given size
+			$result['results'] = array_slice($result['results'], 0, $this->limit);
 		}
 
 		if (!$result['exactIdMatch'] && filter_var($search, FILTER_VALIDATE_EMAIL)) {
