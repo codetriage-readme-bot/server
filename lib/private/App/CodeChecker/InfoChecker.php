@@ -23,119 +23,48 @@
 
 namespace OC\App\CodeChecker;
 
-use OC\App\InfoParser;
 use OC\Hooks\BasicEmitter;
+use OCP\App\AppPathNotFoundException;
+use OCP\App\IAppManager;
 
 class InfoChecker extends BasicEmitter {
 
-	/** @var InfoParser */
-	private $infoParser;
+	/** @var IAppManager */
+	private $appManager;
 
-	private $mandatoryFields = [
-		'author',
-		'description',
-		'dependencies',
-		'id',
-		'licence',
-		'name',
-		'version',
-	];
-	private $optionalFields = [
-		'bugs',
-		'category',
-		'default_enable',
-		'documentation',
-		'namespace',
-		'ocsid',
-		'public',
-		'remote',
-		'repository',
-		'types',
-		'website',
-	];
-	private $deprecatedFields = [
-		'info',
-		'require',
-		'requiremax',
-		'requiremin',
-		'shipped',
-		'standalone',
-	];
-
-	public function __construct(InfoParser $infoParser) {
-		$this->infoParser = $infoParser;
+	public function __construct(IAppManager $appManager) {
+		$this->appManager = $appManager;
 	}
 
 	/**
 	 * @param string $appId
 	 * @return array
 	 */
-	public function analyse($appId) {
-		$appPath = \OC_App::getAppPath($appId);
-		if ($appPath === false) {
-			throw new \RuntimeException("No app with given id <$appId> known.");
+	public function analyse($appId): array {
+		try {
+			$appPath = $this->appManager->getAppPath($appId);
+		} catch (AppPathNotFoundException $e) {
+			throw new \RuntimeException("No app with given id $appId known.");
+		}
+
+		$xml = new \DOMDocument();
+		$xml->load($appPath . '/appinfo/info.xml');
+
+		$schema = \OC::$SERVERROOT . '/resources/app-info.xsd';
+		if ($this->appManager->isShipped($appId)) {
+			// Shipped apps are allowed to have the public and default_enabled tags
+			$schema = \OC::$SERVERROOT . '/resources/app-info-shipped.xsd';
 		}
 
 		$errors = [];
-
-		$info = $this->infoParser->parse($appPath . '/appinfo/info.xml');
-
-		if (!isset($info['dependencies']['nextcloud']['@attributes']['min-version'])) {
-			$errors[] = [
-				'type' => 'missingRequirement',
-				'field' => 'min',
-			];
-			$this->emit('InfoChecker', 'missingRequirement', ['min']);
-		}
-
-		if (!isset($info['dependencies']['nextcloud']['@attributes']['max-version'])) {
-			$errors[] = [
-				'type' => 'missingRequirement',
-				'field' => 'max',
-			];
-			$this->emit('InfoChecker', 'missingRequirement', ['max']);
-		}
-
-		foreach ($info as $key => $value) {
-			if(is_array($value)) {
-				$value = json_encode($value);
-			}
-			if (in_array($key, $this->mandatoryFields)) {
-				$this->emit('InfoChecker', 'mandatoryFieldFound', [$key, $value]);
-				continue;
-			}
-
-			if (in_array($key, $this->optionalFields)) {
-				$this->emit('InfoChecker', 'optionalFieldFound', [$key, $value]);
-				continue;
-			}
-
-			if (in_array($key, $this->deprecatedFields)) {
-				// skip empty arrays - empty arrays for remote and public are always added
-				if($value === '[]' && in_array($key, ['public', 'remote', 'info'])) {
-					continue;
-				}
-				$this->emit('InfoChecker', 'deprecatedFieldFound', [$key, $value]);
-				continue;
-			}
-
-			$this->emit('InfoChecker', 'unusedFieldFound', [$key, $value]);
-		}
-
-		foreach ($this->mandatoryFields as $key) {
-			if(!isset($info[$key])) {
-				$this->emit('InfoChecker', 'mandatoryFieldMissing', [$key]);
+		if (!$xml->schemaValidate($schema)) {
+			foreach (libxml_get_errors() as $error) {
 				$errors[] = [
-					'type' => 'mandatoryFieldMissing',
-					'field' => $key,
+					'type' => 'parseError',
+					'field' => $error->message,
 				];
+				$this->emit('InfoChecker', 'parseError', [$error->message]);
 			}
-		}
-
-		$versionFile = $appPath . '/appinfo/version';
-		if (is_file($versionFile)) {
-			$version = trim(file_get_contents($versionFile));
-			$this->emit('InfoChecker', 'migrateVersion', [$version]);
 		}
 
 		return $errors;
