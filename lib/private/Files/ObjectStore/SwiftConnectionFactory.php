@@ -22,8 +22,20 @@ declare(strict_types=1);
 
 namespace OC\Files\ObjectStore;
 
+use GuzzleHttp\Client;
+use GuzzleHttp\Exception\ClientException;
+use GuzzleHttp\Exception\ConnectException;
+use GuzzleHttp\Exception\RequestException;
+use GuzzleHttp\HandlerStack;
+use OCP\Files\StorageAuthException;
+use OCP\Files\StorageNotAvailableException;
 use OCP\ICache;
+use OpenStack\Common\Error\BadResponseError;
+use OpenStack\Identity\v2\Models\Token;
+use OpenStack\Identity\v2\Service;
 use OpenStack\OpenStack;
+use OpenStack\Common\Transport\Utils as TransportUtils;
+use Psr\Http\Message\RequestInterface;
 
 class SwiftConnectionFactory {
 	private $cache;
@@ -32,41 +44,26 @@ class SwiftConnectionFactory {
 		$this->cache = $cache;
 	}
 
-	private function importToken(OpenStack $client, string $cacheKey) {
+	private function getCachedToken(string $cacheKey) {
 		$cachedTokenString = $this->cache->get($cacheKey . '/token');
 		if ($cachedTokenString) {
-			$cachedToken = json_decode($cachedTokenString, true);
-			$cachedToken['catalog'] = array_map(function (array $item) {
-				$itemClass = new \stdClass();
-				$itemClass->name = $item['name'];
-				$itemClass->endpoints = array_map(function (array $endpoint) {
-					return (object)$endpoint;
-				}, $item['endpoints']);
-				$itemClass->type = $item['type'];
-
-				return $itemClass;
-			}, $cachedToken['catalog']);
-			try {
-				$client->identityV2($cachedToken);
-			} catch (\Exception $e) {
-				$client->setTokenObject(new Token());
-			}
+			return json_decode($cachedTokenString);
+		} else {
+			return null;
 		}
 	}
 
-	private function exportToken(OpenStack $client, string $cacheKey) {
-		$export = $client->exportCredentials();
-		$export['catalog'] = array_map(function (CatalogItem $item) {
-			return [
-				'name' => $item->getName(),
-				'endpoints' => $item->getEndpoints(),
-				'type' => $item->getType()
-			];
-		}, $export['catalog']->getItems());
-		$this->cache->set('$cacheKey . \'/token\'', json_encode($export));
+	private function cacheToken(Token $token, string $cacheKey) {
+		$this->cache->set($cacheKey . '/token', json_encode($token));
 	}
 
-	public function getConnection() {
+	/**
+	 * @param array $params
+	 * @return OpenStack
+	 * @throws StorageAuthException
+	 * @throws \Exception
+	 */
+	private function getClient(array &$params) {
 		if (isset($params['bucket'])) {
 			$params['container'] = $params['bucket'];
 		}
@@ -78,82 +75,80 @@ class SwiftConnectionFactory {
 			$params['autocreate'] = false;
 		}
 
-		$client = new OpenStack($params['url'], $params);
 		$cacheKey = $params['username'] . '@' . $params['url'] . '/' . $params['bucket'];
+		$token = $this->getCachedToken($cacheKey);
+		$hasToken = is_array($token) && (new \DateTimeImmutable($token['expires_at'])) > (new \DateTimeImmutable('now'));
+		if ($hasToken) {
+			$params['cachedToken'] = $token;
+		}
+		$httpClient = new Client([
+			'base_uri' => TransportUtils::normalizeUrl($params['url']),
+			'handler' => HandlerStack::create()
+		]);
 
-		$this->importToken($client, $cacheKey);
+		$authService = Service::factory($httpClient);
+		$params['identityService'] = $authService;
+		$params['authUrl'] = $params['url'];
+		$client = new OpenStack($params);
 
-		/** @var Token $token */
-		$token = $client->getTokenObject();
-
-		if (!$token || $token->hasExpired()) {
+		if (!$hasToken) {
 			try {
-				$client->authenticate();
-				$this->exportToken($client, $cacheKey);
-			} catch (ClientErrorResponseException $e) {
+				$token = $authService->generateToken($params);
+				$this->cacheToken($token, $cacheKey);
+			} catch (ConnectException $e) {
+				throw new StorageAuthException('Failed to connect to keystone, verify the keystone url', $e);
+			} catch (ClientException $e) {
 				$statusCode = $e->getResponse()->getStatusCode();
-				if ($statusCode == 412) {
+				if ($statusCode === 404) {
+					throw new StorageAuthException('Keystone not found, verify the keystone url', $e);
+				} else if ($statusCode === 412) {
 					throw new StorageAuthException('Precondition failed, verify the keystone url', $e);
 				} else if ($statusCode === 401) {
 					throw new StorageAuthException('Authentication failed, verify the username, password and possibly tenant', $e);
 				} else {
 					throw new StorageAuthException('Unknown error', $e);
 				}
+			} catch (RequestException $e) {
+				throw new StorageAuthException('Connection reset while connecting to keystone, verify the keystone url', $e);
 			}
 		}
 
+		return $client;
+	}
 
-		/** @var Catalog $catalog */
-		$catalog = $this->client->getCatalog();
+	/**
+	 * @param array $params
+	 * @return \OpenStack\ObjectStore\v1\Models\Container
+	 * @throws StorageAuthException
+	 * @throws \Exception
+	 */
+	public function getContainer(array $params) {
 
-		/** @suppress PhanNonClassMethodCall */
-		if (count($catalog->getItems()) === 0) {
-			throw new StorageAuthException('Keystone did not provide a valid catalog, verify the credentials');
-		}
+		$client = $this->getClient($params);
+		$objectStoreService = $client->objectStoreV1();
 
-		if (isset($this->params['serviceName'])) {
-			$serviceName = $this->params['serviceName'];
-		} else {
-			$serviceName = Service::DEFAULT_NAME;
-		}
-
-		if (isset($this->params['urlType'])) {
-			$urlType = $this->params['urlType'];
-			if ($urlType !== 'internalURL' && $urlType !== 'publicURL') {
-				throw new StorageNotAvailableException('Invalid url type');
-			}
-		} else {
-			$urlType = Service::DEFAULT_URL_TYPE;
-		}
-
-		$catalogItem = $this->getCatalogForService($catalog, $serviceName);
-		if (!$catalogItem) {
-			$available = implode(', ', $this->getAvailableServiceNames($catalog));
-			throw new StorageNotAvailableException(
-				"Service $serviceName not found in service catalog, available services: $available"
-			);
-		} else if (isset($this->params['region'])) {
-			$this->validateRegion($catalogItem, $this->params['region']);
-		}
-
-		$this->objectStoreService = $this->client->objectStoreService($serviceName, $this->params['region'], $urlType);
-
+		$autoCreate = isset($params['autocreate']) && $params['autocreate'] === true;
 		try {
-			$this->container = $this->objectStoreService->getContainer($this->params['container']);
-		} catch (ClientErrorResponseException $ex) {
+			$container = $objectStoreService->getContainer($params['container']);
+			if ($autoCreate) {
+				$container->getMetadata();
+			}
+			return $container;
+		} catch (BadResponseError $ex) {
 			// if the container does not exist and autocreate is true try to create the container on the fly
-			if (isset($this->params['autocreate']) && $this->params['autocreate'] === true) {
-				$this->container = $this->objectStoreService->createContainer($this->params['container']);
+			if ($ex->getResponse()->getStatusCode() === 404 && $autoCreate) {
+				return $objectStoreService->createContainer([
+					'name' => $params['container']
+				]);
 			} else {
 				throw $ex;
 			}
-		} catch (CurlException $e) {
-			if ($e->getErrorNo() === 7) {
-				$host = $e->getCurlHandle()->getUrl()->getHost() . ':' . $e->getCurlHandle()->getUrl()->getPort();
-				\OC::$server->getLogger()->error("Can't connect to object storage server at $host");
-				throw new StorageNotAvailableException("Can't connect to object storage server at $host", StorageNotAvailableException::STATUS_ERROR, $e);
-			}
-			throw $e;
+		} catch (ConnectException $e) {
+			/** @var RequestInterface $request */
+			$request = $e->getRequest();
+			$host = $request->getUri()->getHost() . ':' . $request->getUri()->getPort();
+			\OC::$server->getLogger()->error("Can't connect to object storage server at $host");
+			throw new StorageNotAvailableException("Can't connect to object storage server at $host", StorageNotAvailableException::STATUS_ERROR, $e);
 		}
 	}
 }
