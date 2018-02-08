@@ -121,6 +121,7 @@ class Swift implements IObjectStore {
 		/** @var Catalog $catalog */
 		$catalog = $this->client->getCatalog();
 
+		/** @suppress PhanNonClassMethodCall */
 		if (count($catalog->getItems()) === 0) {
 			throw new StorageAuthException('Keystone did not provide a valid catalog, verify the credentials');
 		}
